@@ -22,6 +22,11 @@ Black-Backup is a full-featured server snapshot and restore tool for Ubuntu 24 (
 Connect to your server and paste the full contents of `install.sh` into your terminal, then run:
 
 ```bash
+bash <(curl -s https://raw.githubusercontent.com/saeederamy/black-backup/main/install.sh)
+```
+OR:
+
+```bash
 sudo bash install.sh
 ```
 
