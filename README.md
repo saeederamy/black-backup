@@ -24,7 +24,7 @@ Connect to your server and paste the full contents of `install.sh` into your ter
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/saeederamy/black-backup/main/install.sh)
 ```
-OR:
+or uplaod on server and run:
 
 ```bash
 sudo bash install.sh
