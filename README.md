@@ -1,40 +1,39 @@
 # Black-Backup
 
-Black-Backup is a full-featured server snapshot and restore tool for Ubuntu 24 (AMD64). It lets you take a complete system backup — including all installed software, services, configs, and project files — and restore it on any fresh server with a single command. No rescue mode required.
+Black-Backup is a full-featured server snapshot and restore tool for **Linux (Ubuntu 24)** and **Windows (Server / Desktop)**. Take a complete system backup — installed software, services, configs, project files — and restore it on any fresh server with a single command.
 
 ---
 
-## ✨ Features
+## 📋 Table of Contents
 
-- 📦 **Full backup** — complete system snapshot, safest option
-- 🪶 **Light backup** — skips logs, cache, docker layers, snap packages (much smaller size)
-- 🔁 **Incremental backup** — only stores files changed since last backup (minimum storage)
-- 🔗 **Chain restore** — pick any checkpoint: system merges layers in order automatically
-- 🌐 Temporary HTTP download link with automatic firewall management
-- 🔒 Port opens on download start and closes automatically on Ctrl+C
-- 📋 View all backups with type, date, size, and file path
-- 🗑️ Delete individual backups (warns if base has dependent incrementals)
-- 🔧 Auto UUID fix in `/etc/fstab` after restore
-- 🌐 Auto network interface name fix after restore
-- ⚙️ Kernel module + initramfs rebuild after restore
-- 🥾 GRUB reinstall after restore
-- 🧹 Full uninstall option from within the menu
+- [Linux](#-linux)
+- [Windows](#-windows)
+- [Backup Types (both platforms)](#-backup-types)
+- [Incremental & Chain Restore](#-incremental--chain-restore)
 
 ---
 
-## ⚡ One-Line Installation
+# 🐧 Linux
+
+## ⚡ One-Line Install (online)
+
+Open a terminal on your server and run:
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/saeederamy/black-backup/main/install.sh)
 ```
 
-Or upload to server and run:
+## 📋 Offline Install (paste method)
+
+No internet on the server? Copy the **entire content** of `install.sh`, paste it directly into your terminal, and press **Enter**. The heredoc runs as-is — no file needed.
+
+Or upload the file and run:
 
 ```bash
 sudo bash install.sh
 ```
 
-After installation, the `black-backup` command is available system-wide:
+After installation:
 
 ```bash
 black-backup
@@ -42,7 +41,7 @@ black-backup
 
 ---
 
-## 🖥️ Menu
+## 🖥️ Linux Menu
 
 ```
   ╔══════════════════════════════════════════╗
@@ -62,197 +61,197 @@ black-backup
 
 ---
 
-## 📦 Backup — Three Modes
+## 🔧 Linux Requirements
 
-When you select **Take a Backup**, you choose the type:
+- Ubuntu 24 LTS (AMD64)
+- `bash` 5+, `tar`, `curl` (pre-installed)
+- `python3` — auto-installed if missing
+- `pv` — auto-installed if missing
+- Root / sudo access
+
+---
+
+# 🪟 Windows
+
+## ⚡ One-Line Install (online)
+
+Open **PowerShell as Administrator** and run:
+
+```powershell
+irm https://raw.githubusercontent.com/saeederamy/black-backup/main/install.ps1 | iex
+```
+
+## 📋 Offline Install — Method 1: paste
+
+No internet? Copy the **entire content** of `install.ps1`, paste it into an **Administrator PowerShell** window, and press **Enter**. Works exactly like the Linux paste method.
+
+## 📋 Offline Install — Method 2: download & run
+
+```powershell
+# Download
+$f = "$env:TEMP\bb-install.ps1"
+Invoke-WebRequest "https://raw.githubusercontent.com/saeederamy/black-backup/main/install.ps1" -OutFile $f
+
+# Run as Administrator
+Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -File `"$f`"" -Verb RunAs
+```
+
+Or if you already have the file:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+After installation, `black-backup` is available from **any Administrator prompt**:
+
+```powershell
+black-backup
+```
+
+---
+
+## 🖥️ Windows Menu
+
+```
+  +==========================================+
+  |      BLACK-BACKUP  v1.0  (Windows)       |
+  |    Server Snapshot & Restore Tool        |
+  +==========================================+
+
+  Main Menu
+
+  1)  Take a Backup
+  2)  Restore from Backup
+  3)  View Backups & Download
+  4)  Delete a Backup
+  5)  Uninstall black-backup
+  0)  Exit
+```
+
+---
+
+## 🔧 Windows Requirements
+
+- Windows 10 / 11 or Windows Server 2019 / 2022
+- PowerShell 5.1+ (pre-installed on all modern Windows)
+- Administrator privileges
+- **VSS service** running (`vssadmin list providers` to verify)
+- **DISM** (pre-installed on all modern Windows)
+- Internet access only needed for the one-liner install
+
+---
+
+## 🗂️ Windows Storage Paths
+
+| Path | Description |
+|------|-------------|
+| `C:\BlackBackup\*.wim` | Full / Light backup image (DISM WIM format) |
+| `C:\BlackBackup\*.zip` | Incremental backup (changed files, ZIP) |
+| `C:\BlackBackup\*.meta` | Metadata: name, date, size, type, base, sequence |
+| `C:\BlackBackup\black-backup.log` | Operation log |
+| `C:\Program Files\BlackBackup\` | Installed tool |
+
+---
+
+# 📦 Backup Types
+
+Both platforms offer the same three modes:
 
 ```
   1)  Full Backup
        Complete system snapshot — safest, largest size
 
   2)  Light Backup
-       Skips logs, cache, docker layers, snaps — smaller size
+       Skips logs, cache, docker/snap (Linux) or temp/logs/WD scans (Windows)
+       Typical size reduction: 40–70%
 
   3)  Incremental Backup
-       Only files changed since last backup — minimum storage
+       Only files changed since the last backup — minimum storage
+       Example: 2 GB full → 2 weeks later → 0.5 GB incremental (not 2 GB again)
        Requires an existing full or light base backup
 ```
 
-### 1) Full Backup
-- Complete snapshot of the entire system
-- Largest file size but most complete
-- Best for: first-time backup, disaster recovery
+### What each backup excludes
 
-### 2) Light Backup
-- Same as full but excludes heavy directories
-- **Excluded:** `/var/log`, `/var/cache`, `/var/lib/docker`, `/var/lib/containerd`, `/var/lib/snapd`, `/snap`, `/usr/share/doc`, `/usr/share/man`, `/usr/share/locale`, user `~/.cache` folders
-- Typical size reduction: 40–70% compared to full backup
+**Linux — Full:** `/proc` `/sys` `/dev` `/run` `/tmp` `/mnt` `/media` `/lost+found`
 
-### 3) Incremental Backup
-- Only archives files **modified since the last backup** (full, light, or previous incremental)
-- Example: 2GB full backup → 2 weeks later only 0.5GB of changes → incremental is 0.5GB
-- Each incremental is linked to its base backup and numbered in sequence
-- **Requires** a full or light base backup to exist first
+**Linux — Light (additional):** `/var/log` `/var/cache` `/var/lib/docker` `/var/lib/containerd` `/snap` `/usr/share/doc` `/usr/share/man` `~/.cache`
 
-### Excluded from all backups:
-`/proc` `/sys` `/dev` `/run` `/tmp` `/mnt` `/media` `/lost+found`
+**Windows — Light (additional):** `pagefile.sys` `hiberfil.sys` `Windows\Temp` `Windows\Logs` `SoftwareDistribution\Download` `Windows Defender\Scans` user `AppData\Local\Temp` browser caches
 
 ---
 
-## 🔁 Restore
+# 🔁 Incremental & Chain Restore
 
-Restore supports three sources:
+### How it works
 
-1. **Pick from saved backups** — lists all backups on this server
-2. **Local file path** — provide the full path to a `.tar.gz` file
-3. **Download URL** — paste the HTTP link from another server running Black-Backup
+Each incremental backup is linked to a **base** (full or light) backup and gets a sequence number:
 
-### Incremental Chain Restore
+```
+  base  →  inc#1  →  inc#2  →  inc#3  →  inc#4  →  inc#5
+  2 GB     120 MB    95 MB     210 MB    80 MB     310 MB
+```
 
-When restoring a backup that has incrementals (or selecting an incremental directly), Black-Backup asks **which checkpoint to restore to**:
+Total storage: `2 GB + 0.8 GB` instead of `2 GB × 6`
+
+### Restore to any checkpoint
+
+When restoring or downloading, Black-Backup asks which checkpoint you want:
 
 ```
   Backup chain for: my-server-20250518
 
-  #    Type     Name                           Date                   Size
-  1)   base     my-server-20250518             2025-05-18 14:00:00    1.8G
-  2)   inc#1    my-server-inc1                 2025-06-01 10:00:00    120M
-  3)   inc#2    my-server-inc2                 2025-06-15 09:00:00    95M
-  4)   inc#3    my-server-inc3                 2025-07-01 11:00:00    210M
+  #    Type     Name                      Date                   Size
+  1)   base     my-server-20250518        2025-05-18 14:00:00    1.8G
+  2)   inc#1    my-server-inc1            2025-06-01 10:00:00    120M
+  3)   inc#2    my-server-inc2            2025-06-15 09:00:00    95M
+  4)   inc#3    my-server-inc3            2025-07-01 11:00:00    210M
 
-  Select the checkpoint you want to restore TO.
   All layers from #1 up to your choice will be merged.
 
   Checkpoint number [4]:
 ```
 
-If you enter `3`, the system applies layers 1 → 2 → 3 in order, giving you the exact state at that point in time. Layer 4 is ignored.
+Enter `3` → system merges layers **1 + 2 + 3** and applies/downloads that. Layer 4 is ignored.
 
-After extraction:
-- `/etc/fstab` UUIDs are automatically detected and corrected
-- Network interface names are fixed for the new server
-- Kernel modules and initramfs are rebuilt
-- GRUB bootloader is reinstalled
-- `systemd` is reloaded
+### On Linux — direct restore
 
-> No rescue mode needed. Works on a live fresh Ubuntu 24 installation.
+Layers are extracted in order directly to `/`. Post-restore fixes run automatically (UUID, network, initramfs, GRUB).
+
+### On Windows — one-restart restore
+
+1. Black-Backup injects a restore script into **WinRE** (`startnet.cmd`)
+2. Arms `reagentc /boottore` so WinRE runs on next boot
+3. You reboot once
+4. WinRE applies the base WIM with DISM, then overlays each incremental layer
+5. Fixes bootloader with `bcdboot`, reboots into the restored Windows
+
+> No WinPE USB or recovery media needed.
 
 ---
 
 ## 🌐 Temporary Download Link
 
-When you generate a download link, Black-Backup:
+After taking a backup, Black-Backup can serve it over HTTP so you can download it on another server.
 
-1. Installs Python3 if not present
-2. Opens the firewall port (`8765`) automatically — both `ufw` and `iptables`
-3. Starts an HTTP server in the foreground
-4. Displays the full download URL
+**Linux** — uses Python's built-in HTTP server  
+**Windows** — uses .NET `HttpListener` (streamed, handles multi-GB files)
 
 ```
-  ╔══════════════════════════════════════════╗
-  ║         DOWNLOAD LINK  (active)          ║
-  ╠══════════════════════════════════════════╣
-  ║  http://YOUR_SERVER_IP:8765/backup.tar.gz
-  ╚══════════════════════════════════════════╝
+  +==========================================+
+  |         DOWNLOAD LINK  (active)          |
+  |  http://YOUR_SERVER_IP:8765/backup.wim   |
+  +==========================================+
 ```
 
-5. When you press **Ctrl+C**, the server stops and the firewall port is closed automatically
-
-### Downloading an Incremental Chain
-
-When you select an incremental backup (or a base with incrementals) from the **View Backups** menu, you are asked which checkpoint to download. Black-Backup then:
-
-1. Merges all layers up to the selected checkpoint into a single combined `.tar.gz`
-2. Starts the HTTP server serving the merged archive
-3. Cleans up the temp file after the server stops
-
-This lets you download a fully self-contained restore archive to any new server.
-
----
-
-## 🗂️ View Backups
-
-Option `3` from the main menu lists all backups with their type:
-
-```
-  1)  [FULL ] my-server-snapshot
-       2025-05-18 14:32:00    1.8G
-       Path: /var/backups/black-backup/my-server-snapshot.tar.gz
-
-  2)  [LITE ] my-server-light
-       2025-05-18 15:00:00    680M
-       Path: /var/backups/black-backup/my-server-light.tar.gz
-
-  3)  [INC#1] my-server-inc-june
-       2025-06-01 10:00:00    95M
-       Path: /var/backups/black-backup/my-server-inc-june.tar.gz
-       Base: my-server-snapshot
-```
-
-Enter a number to download that backup (incremental backups will ask which checkpoint to merge).
+- Firewall port `8765` is opened automatically (ufw/iptables on Linux, Windows Firewall on Windows)
+- Press **Ctrl+C** to stop — port closes automatically
 
 ---
 
 ## 🗑️ Delete a Backup
 
-Select option `4` from the main menu.
-
-> **Warning:** If you delete a base backup (full or light) that has incremental backups depending on it, Black-Backup will warn you and offer to delete the base **and all its incrementals** together. Incrementals cannot be restored without their base.
-
----
-
-## 🗑️ Uninstall
-
-Select option `5` from the main menu and type `YES` to confirm. This removes:
-
-- `/usr/local/bin/black-backup`
-- All backups in `/var/backups/black-backup/`
-
-Or manually:
-
-```bash
-sudo rm /usr/local/bin/black-backup
-sudo rm -rf /var/backups/black-backup
-```
-
----
-
-## 📁 Backup Storage
-
-| Path | Description |
-|------|-------------|
-| `/var/backups/black-backup/*.tar.gz` | Compressed system snapshot (full, light, or incremental layer) |
-| `/var/backups/black-backup/*.meta` | Metadata: name, date, size, hostname, type, base, sequence |
-
-### Meta file format (v3)
-
-```
-name=my-server-inc1
-date=2025-06-01 10:00:00
-size=95M
-hostname=myserver
-file=/var/backups/black-backup/my-server-inc1.tar.gz
-interfaces=eth0,
-kernel=6.8.0-57-generic
-arch=x86_64
-os=Ubuntu 24.04.2 LTS
-type=incremental
-base=my-server-snapshot
-sequence=1
-```
-
-`type` is one of: `full`, `light`, `incremental`
-
----
-
-## 🔧 Requirements
-
-- Ubuntu 24 LTS (AMD64)
-- `bash` 5+
-- `tar`, `curl` (pre-installed on Ubuntu)
-- `python3` — auto-installed if missing
-- `pv` — auto-installed if missing (progress bar)
-- Root / sudo access
+If you delete a **base backup** that has incrementals depending on it, Black-Backup warns you and offers to delete the base **and all its incrementals** together. Incrementals cannot be restored without their base.
 
 ---
 
