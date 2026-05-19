@@ -16,12 +16,16 @@ HTTP_PORT=8765
 UFW_OPENED=0
 IPTABLES_OPENED=0
 
+# Global return values for functions that can't return arrays
+_CHAIN_RESULT=()
+_MERGE_FILE=""
+
 # ─────────────────────────────────────────────────────────────
 banner() {
     clear
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════╗"
-    echo "  ║           BLACK-BACKUP  v2.0             ║"
+    echo "  ║           BLACK-BACKUP  v3.0             ║"
     echo "  ║     Server Snapshot & Restore Tool       ║"
     echo "  ╚══════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -93,8 +97,11 @@ ask_backup_name() {
     BACKUP_META="${BACKUP_DIR}/${BACKUP_NAME}.meta"
 }
 
+# save_meta <type> [base_name] [sequence]
 save_meta() {
-    # save current network interface names into meta for later restore fix
+    local TYPE="${1:-full}"
+    local BASE="${2:-}"
+    local SEQ="${3:-}"
     local IFACES
     IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | tr '\n' ',')
     cat > "$BACKUP_META" <<META
@@ -107,6 +114,9 @@ interfaces=$IFACES
 kernel=$(uname -r)
 arch=$(uname -m)
 os=$(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')
+type=$TYPE
+base=$BASE
+sequence=$SEQ
 META
 }
 
@@ -148,12 +158,138 @@ start_http_server() {
 }
 
 # ─────────────────────────────────────────────────────────────
-do_backup() {
-    banner
-    echo -e "  ${BOLD}═══ BACKUP MODE ═══${NC}"
+# Return via stdout: sorted list of incremental .meta files for a base backup
+get_incrementals_for_base() {
+    local BASE_NAME="$1"
+    for M in "$BACKUP_DIR"/*.meta; do
+        [[ -f "$M" ]] || continue
+        local T B SEQ
+        T=$(grep '^type=' "$M" | cut -d= -f2-)
+        B=$(grep '^base=' "$M" | cut -d= -f2-)
+        SEQ=$(grep '^sequence=' "$M" | cut -d= -f2-)
+        [[ "$T" == "incremental" && "$B" == "$BASE_NAME" ]] && echo "$SEQ $M"
+    done | sort -n | awk '{print $2}'
+}
+
+# Find the base .meta file for a given meta file (returns via echo).
+# For non-incremental, echoes the file itself.
+find_base_meta() {
+    local META_FILE="$1"
+    local TYPE BASE
+    TYPE=$(grep '^type=' "$META_FILE" | cut -d= -f2-)
+    if [[ "$TYPE" != "incremental" ]]; then
+        echo "$META_FILE"; return 0
+    fi
+    BASE=$(grep '^base=' "$META_FILE" | cut -d= -f2-)
+    local BASE_META="${BACKUP_DIR}/${BASE}.meta"
+    if [[ ! -f "$BASE_META" ]]; then
+        log_err "Base backup not found: $BASE"; return 1
+    fi
+    echo "$BASE_META"
+}
+
+# Ask user which checkpoint in a chain to use.
+# Sets global _CHAIN_RESULT to the ordered list of meta files up to chosen point.
+ask_chain_checkpoint() {
+    local BASE_META="$1"
+    local BASE_NAME
+    BASE_NAME=$(grep '^name=' "$BASE_META" | cut -d= -f2-)
+
+    local ALL_METAS=("$BASE_META")
+    while IFS= read -r INC; do
+        ALL_METAS+=("$INC")
+    done < <(get_incrementals_for_base "$BASE_NAME")
+
+    if [[ ${#ALL_METAS[@]} -eq 1 ]]; then
+        # Only the base — no choice needed
+        _CHAIN_RESULT=("$BASE_META")
+        return 0
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Backup chain for: ${CYAN}${BASE_NAME}${NC}"
     divider
+    printf "  ${CYAN}%-4s${NC} %-8s %-30s %-22s %s\n" "#" "Type" "Name" "Date" "Size"
+    echo ""
+
+    local I=1
+    for M in "${ALL_METAS[@]}"; do
+        local N D S T SEQ
+        N=$(grep '^name=' "$M" | cut -d= -f2-)
+        D=$(grep '^date=' "$M" | cut -d= -f2-)
+        S=$(grep '^size=' "$M" | cut -d= -f2-)
+        T=$(grep '^type=' "$M" | cut -d= -f2-)
+        SEQ=$(grep '^sequence=' "$M" | cut -d= -f2-)
+        [[ "$T" == "full" || "$T" == "light" || -z "$T" ]] && T="base"
+        [[ "$T" == "incremental" ]] && T="inc#$SEQ"
+        printf "  ${CYAN}%-4s${NC} %-8s %-30s %-22s %s\n" "$I)" "$T" "$N" "$D" "$S"
+        I=$((I+1))
+    done
+
+    echo ""
+    log_info "Select the checkpoint you want to restore/download TO."
+    log_info "All layers from #1 up to your choice will be merged."
+    echo ""
+    read -rp "  Checkpoint number [${#ALL_METAS[@]}]: " SEL
+    SEL="${SEL:-${#ALL_METAS[@]}}"
+
+    if ! [[ "$SEL" =~ ^[0-9]+$ ]] || [[ $SEL -lt 1 || $SEL -gt ${#ALL_METAS[@]} ]]; then
+        log_err "Invalid selection."; return 1
+    fi
+
+    _CHAIN_RESULT=("${ALL_METAS[@]:0:$SEL}")
+    return 0
+}
+
+# Merge an array of meta files into a single combined archive.
+# Sets global _MERGE_FILE to the path of the merged archive.
+merge_chain_for_download() {
+    local CHAIN=("$@")
+    local MERGE_DIR="/tmp/black-backup-merge-$$"
+    _MERGE_FILE="/tmp/black-backup-merged-$$.tar.gz"
+
+    mkdir -p "$MERGE_DIR"
+    log_step "Merging ${#CHAIN[@]} backup layer(s) into a single archive..."
+
+    for META in "${CHAIN[@]}"; do
+        local FILE TYPE SEQ
+        FILE=$(grep '^file=' "$META" | cut -d= -f2-)
+        TYPE=$(grep '^type=' "$META" | cut -d= -f2-)
+        SEQ=$(grep '^sequence=' "$META" | cut -d= -f2-)
+        [[ -z "$TYPE" ]] && TYPE="full"
+        [[ "$TYPE" == "incremental" ]] && TYPE="inc#$SEQ"
+        if [[ ! -f "$FILE" ]]; then
+            log_err "Archive not found: $FILE"; rm -rf "$MERGE_DIR"; return 1
+        fi
+        log_step "Applying [$TYPE]: $(basename "$FILE")..."
+        tar -xzpf "$FILE" -C "$MERGE_DIR" 2>/dev/null || true
+    done
+
+    log_step "Repacking merged archive (this may take a while)..."
+    if command -v pv &>/dev/null; then
+        local USED
+        USED=$(du -sk "$MERGE_DIR" | cut -f1)
+        tar -czp -C "$MERGE_DIR" . 2>/dev/null | pv -s "${USED}k" > "$_MERGE_FILE"
+    else
+        tar -czpf "$_MERGE_FILE" -C "$MERGE_DIR" . 2>/dev/null
+    fi
+
+    rm -rf "$MERGE_DIR"
+
+    if [[ ! -f "$_MERGE_FILE" ]]; then
+        log_err "Merge failed."; return 1
+    fi
+
+    local SZ
+    SZ=$(du -sh "$_MERGE_FILE" | cut -f1)
+    log_ok "Merged archive ready ($SZ): $_MERGE_FILE"
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────
+do_full_backup() {
     mkdir -p "$BACKUP_DIR"
-    log_section "BACKUP START"
+    log_section "FULL BACKUP START"
     ask_backup_name
 
     if [[ -f "$BACKUP_FILE" ]]; then
@@ -184,11 +320,11 @@ do_backup() {
         tar -czpf "$BACKUP_FILE" "${EXCL[@]}" /
     fi
 
-    save_meta
+    save_meta "full"
     SIZE=$(du -sh "$BACKUP_FILE" | cut -f1)
     echo ""
     divider
-    log_ok "Backup completed!"
+    log_ok "Full backup completed!"
     log_info "Name   : $BACKUP_NAME"
     log_info "File   : $BACKUP_FILE"
     log_info "Size   : $SIZE"
@@ -198,6 +334,204 @@ do_backup() {
 
     read -rp "  Generate a temporary download link? (y/n): " WANT_LINK
     [[ "$WANT_LINK" =~ ^[Yy]$ ]] && start_http_server "$BACKUP_FILE"
+}
+
+# ─────────────────────────────────────────────────────────────
+do_light_backup() {
+    mkdir -p "$BACKUP_DIR"
+    log_section "LIGHT BACKUP START"
+    ask_backup_name
+
+    if [[ -f "$BACKUP_FILE" ]]; then
+        log_warn "Backup with this name already exists."
+        read -rp "  Overwrite? (y/n): " OW
+        [[ ! "$OW" =~ ^[Yy]$ ]] && { log_warn "Cancelled."; return; }
+    fi
+
+    echo ""
+    log_step "Starting light backup (excludes logs, cache, docker, snap)..."
+    echo ""
+
+    if ! command -v pv &>/dev/null; then
+        apt-get install -y pv -qq 2>/dev/null || true
+    fi
+
+    EXCL=(
+        --exclude=/proc --exclude=/sys --exclude=/dev
+        --exclude=/run --exclude=/tmp --exclude=/mnt
+        --exclude=/media --exclude=/lost+found
+        --exclude="$BACKUP_DIR"
+        # heavy dirs excluded to keep size small
+        --exclude=/var/cache
+        --exclude=/var/log
+        --exclude=/var/lib/docker
+        --exclude=/var/lib/containerd
+        --exclude=/var/lib/snapd
+        --exclude=/snap
+        --exclude=/usr/share/doc
+        --exclude=/usr/share/man
+        --exclude=/usr/share/locale
+        --exclude=/usr/share/help
+        --exclude=/home/*/.cache
+        --exclude=/root/.cache
+        --exclude=/home/*/.local/share/Trash
+    )
+
+    if command -v pv &>/dev/null; then
+        USED=$(df / --output=used -k | tail -1)
+        tar -czp "${EXCL[@]}" / 2>/dev/null | pv -s "${USED}k" > "$BACKUP_FILE"
+    else
+        tar -czpf "$BACKUP_FILE" "${EXCL[@]}" /
+    fi
+
+    save_meta "light"
+    SIZE=$(du -sh "$BACKUP_FILE" | cut -f1)
+    echo ""
+    divider
+    log_ok "Light backup completed!"
+    log_info "Name   : $BACKUP_NAME"
+    log_info "File   : $BACKUP_FILE"
+    log_info "Size   : $SIZE"
+    log_info "Log    : $LOG_FILE"
+    divider
+    echo ""
+    echo -e "  ${YELLOW}Note:${NC} Excluded: logs, apt/apt-get cache, docker layers,"
+    echo -e "        snap packages, doc/man pages, user caches."
+    echo ""
+
+    read -rp "  Generate a temporary download link? (y/n): " WANT_LINK
+    [[ "$WANT_LINK" =~ ^[Yy]$ ]] && start_http_server "$BACKUP_FILE"
+}
+
+# ─────────────────────────────────────────────────────────────
+do_incremental_backup() {
+    mkdir -p "$BACKUP_DIR"
+    log_section "INCREMENTAL BACKUP START"
+
+    # Find the most recent base (full or light) backup to attach this incremental to
+    local BASE_META="" BASE_NAME="" NEWEST_TIME=0
+    for M in "$BACKUP_DIR"/*.meta; do
+        [[ -f "$M" ]] || continue
+        local T
+        T=$(grep '^type=' "$M" | cut -d= -f2-)
+        if [[ "$T" == "full" || "$T" == "light" ]]; then
+            local MT
+            MT=$(stat -c %Y "$M" 2>/dev/null || echo 0)
+            if [[ $MT -gt $NEWEST_TIME ]]; then
+                NEWEST_TIME=$MT; BASE_META="$M"
+            fi
+        fi
+    done
+
+    if [[ -z "$BASE_META" ]]; then
+        echo ""
+        log_warn "No base backup (full or light) found!"
+        log_warn "An incremental backup requires a full or light base first."
+        echo ""
+        read -rp "  Take a full backup now instead? (y/n): " DOFULL
+        [[ "$DOFULL" =~ ^[Yy]$ ]] && do_full_backup
+        return
+    fi
+
+    BASE_NAME=$(grep '^name=' "$BASE_META" | cut -d= -f2-)
+
+    # Find the most recent entry in this chain (base or latest incremental)
+    local LAST_META="$BASE_META"
+    local LAST_SEQ=0
+    NEWEST_TIME=$(stat -c %Y "$BASE_META" 2>/dev/null || echo 0)
+
+    while IFS= read -r INC; do
+        local MT
+        MT=$(stat -c %Y "$INC" 2>/dev/null || echo 0)
+        if [[ $MT -gt $NEWEST_TIME ]]; then
+            NEWEST_TIME=$MT; LAST_META="$INC"
+        fi
+        local S
+        S=$(grep '^sequence=' "$INC" | cut -d= -f2-)
+        [[ -n "$S" && "$S" -gt "$LAST_SEQ" ]] && LAST_SEQ=$S
+    done < <(get_incrementals_for_base "$BASE_NAME")
+
+    local LAST_DATE NEW_SEQ
+    LAST_DATE=$(grep '^date=' "$LAST_META" | cut -d= -f2-)
+    NEW_SEQ=$((LAST_SEQ + 1))
+
+    echo ""
+    log_info "Base backup    : $BASE_NAME"
+    log_info "Last checkpoint: $LAST_DATE"
+    log_info "New sequence   : #$NEW_SEQ"
+    echo ""
+    log_step "Only files modified after  \"$LAST_DATE\"  will be included."
+    echo ""
+
+    ask_backup_name
+
+    if [[ -f "$BACKUP_FILE" ]]; then
+        log_warn "Backup with this name already exists."
+        read -rp "  Overwrite? (y/n): " OW
+        [[ ! "$OW" =~ ^[Yy]$ ]] && { log_warn "Cancelled."; return; }
+    fi
+
+    if ! command -v pv &>/dev/null; then
+        apt-get install -y pv -qq 2>/dev/null || true
+    fi
+
+    EXCL=(
+        --exclude=/proc --exclude=/sys --exclude=/dev
+        --exclude=/run --exclude=/tmp --exclude=/mnt
+        --exclude=/media --exclude=/lost+found
+        --exclude="$BACKUP_DIR" --exclude=/var/cache/apt
+    )
+
+    log_step "Scanning and archiving changed files..."
+    if command -v pv &>/dev/null; then
+        tar -czp "${EXCL[@]}" --newer-mtime="$LAST_DATE" / 2>/dev/null | pv > "$BACKUP_FILE"
+    else
+        tar -czpf "$BACKUP_FILE" "${EXCL[@]}" --newer-mtime="$LAST_DATE" /
+    fi
+
+    save_meta "incremental" "$BASE_NAME" "$NEW_SEQ"
+    SIZE=$(du -sh "$BACKUP_FILE" | cut -f1)
+    echo ""
+    divider
+    log_ok "Incremental backup completed!"
+    log_info "Name     : $BACKUP_NAME"
+    log_info "File     : $BACKUP_FILE"
+    log_info "Size     : $SIZE"
+    log_info "Base     : $BASE_NAME"
+    log_info "Sequence : #$NEW_SEQ"
+    log_info "Changes since: $LAST_DATE"
+    divider
+    echo ""
+
+    read -rp "  Generate a temporary download link? (y/n): " WANT_LINK
+    [[ "$WANT_LINK" =~ ^[Yy]$ ]] && start_http_server "$BACKUP_FILE"
+}
+
+# ─────────────────────────────────────────────────────────────
+do_backup() {
+    banner
+    echo -e "  ${BOLD}═══ BACKUP MODE ═══${NC}"
+    divider
+    echo ""
+    echo -e "  ${CYAN}1)${NC}  ${BOLD}Full Backup${NC}"
+    echo -e "       Complete system snapshot — safest, largest size"
+    echo ""
+    echo -e "  ${CYAN}2)${NC}  ${BOLD}Light Backup${NC}"
+    echo -e "       Skips logs, cache, docker layers, snaps — smaller size"
+    echo ""
+    echo -e "  ${CYAN}3)${NC}  ${BOLD}Incremental Backup${NC}"
+    echo -e "       Only files changed since last backup — minimum storage"
+    echo -e "       Requires an existing full or light base backup"
+    echo ""
+    divider
+    read -rp "  Backup type (1/2/3): " BT
+    echo ""
+    case "$BT" in
+        1) do_full_backup ;;
+        2) do_light_backup ;;
+        3) do_incremental_backup ;;
+        *) log_err "Invalid choice."; sleep 1 ;;
+    esac
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -223,22 +557,38 @@ list_backups() {
 
         local I=1
         for META in "${METAS[@]}"; do
-            local NAME DATE SIZE FILE
+            local NAME DATE SIZE FILE TYPE SEQ BASE
             NAME=$(grep '^name=' "$META" | cut -d= -f2-)
             DATE=$(grep '^date=' "$META" | cut -d= -f2-)
             SIZE=$(grep '^size=' "$META" | cut -d= -f2-)
             FILE=$(grep '^file=' "$META" | cut -d= -f2-)
-            printf "  ${CYAN}%-4s${NC} %-30s ${YELLOW}%-22s${NC} ${GREEN}%s${NC}\n" \
-                "$I)" "$NAME" "$DATE" "$SIZE"
+            TYPE=$(grep '^type=' "$META" | cut -d= -f2-)
+            SEQ=$(grep '^sequence=' "$META" | cut -d= -f2-)
+            BASE=$(grep '^base=' "$META" | cut -d= -f2-)
+            [[ -z "$TYPE" ]] && TYPE="full"
+
+            local TLABEL
+            case "$TYPE" in
+                full)        TLABEL="${GREEN}[FULL ]${NC}" ;;
+                light)       TLABEL="${BLUE}[LITE ]${NC}" ;;
+                incremental) TLABEL="${YELLOW}[INC#${SEQ}]${NC}" ;;
+                *)           TLABEL="${CYAN}[?????]${NC}" ;;
+            esac
+
+            printf "  ${CYAN}%-4s${NC} " "$I)"
+            echo -e "${TLABEL} ${BOLD}${NAME}${NC}"
+            printf "       ${YELLOW}%-22s${NC}  ${GREEN}%s${NC}\n" "$DATE" "$SIZE"
             printf "       ${MAGENTA}Path: %s${NC}\n" "$FILE"
+            [[ "$TYPE" == "incremental" ]] && printf "       ${CYAN}Base: %s${NC}\n" "$BASE"
             echo ""
             I=$((I+1))
         done
 
         divider
         echo ""
-        echo "  Enter a number to generate a download link,"
-        echo -e "  or ${CYAN}Enter${NC} / ${CYAN}0${NC} to go back."
+        echo "  Enter a backup number to download it."
+        echo -e "  For incremental backups you will be asked which checkpoint to merge."
+        echo -e "  ${CYAN}Enter${NC} / ${CYAN}0${NC} to go back."
         echo ""
         read -rp "  Choice: " NUM
 
@@ -248,14 +598,49 @@ list_backups() {
             log_err "Invalid selection."; sleep 1; continue
         fi
 
-        local SELECTED_FILE
-        SELECTED_FILE=$(grep '^file=' "${METAS[$((NUM-1))]}" | cut -d= -f2-)
+        local SELECTED_META="${METAS[$((NUM-1))]}"
+        local SELECTED_TYPE SELECTED_FILE SELECTED_NAME
+        SELECTED_TYPE=$(grep '^type=' "$SELECTED_META" | cut -d= -f2-)
+        SELECTED_FILE=$(grep '^file=' "$SELECTED_META" | cut -d= -f2-)
+        SELECTED_NAME=$(grep '^name=' "$SELECTED_META" | cut -d= -f2-)
+        [[ -z "$SELECTED_TYPE" ]] && SELECTED_TYPE="full"
 
-        if [[ ! -f "$SELECTED_FILE" ]]; then
-            log_err "Backup file not found: $SELECTED_FILE"; sleep 2; continue
+        local BASE_META
+        if [[ "$SELECTED_TYPE" == "incremental" ]]; then
+            BASE_META=$(find_base_meta "$SELECTED_META") || { sleep 2; continue; }
+        else
+            BASE_META="$SELECTED_META"
         fi
 
-        start_http_server "$SELECTED_FILE"
+        local BASE_NAME INC_COUNT=0
+        BASE_NAME=$(grep '^name=' "$BASE_META" | cut -d= -f2-)
+        while IFS= read -r _; do INC_COUNT=$((INC_COUNT+1)); done \
+            < <(get_incrementals_for_base "$BASE_NAME")
+
+        if [[ $INC_COUNT -gt 0 || "$SELECTED_TYPE" == "incremental" ]]; then
+            # Chain exists — ask which checkpoint
+            _CHAIN_RESULT=()
+            ask_chain_checkpoint "$BASE_META" || { sleep 1; continue; }
+
+            if [[ ${#_CHAIN_RESULT[@]} -eq 1 && "${_CHAIN_RESULT[0]}" == "$SELECTED_META" && "$SELECTED_TYPE" != "incremental" ]]; then
+                # Only base selected, no merging needed
+                if [[ ! -f "$SELECTED_FILE" ]]; then
+                    log_err "Backup file not found: $SELECTED_FILE"; sleep 2; continue
+                fi
+                start_http_server "$SELECTED_FILE"
+            else
+                merge_chain_for_download "${_CHAIN_RESULT[@]}" || { sleep 2; continue; }
+                log_info "Merged file location: $_MERGE_FILE"
+                start_http_server "$_MERGE_FILE"
+                rm -f "$_MERGE_FILE"
+            fi
+        else
+            # Simple single backup
+            if [[ ! -f "$SELECTED_FILE" ]]; then
+                log_err "Backup file not found: $SELECTED_FILE"; sleep 2; continue
+            fi
+            start_http_server "$SELECTED_FILE"
+        fi
     done
 }
 
@@ -277,10 +662,16 @@ delete_backup() {
 
     local I=1
     for META in "${METAS[@]}"; do
+        local NAME DATE SIZE TYPE SEQ
         NAME=$(grep '^name=' "$META" | cut -d= -f2-)
         DATE=$(grep '^date=' "$META" | cut -d= -f2-)
         SIZE=$(grep '^size=' "$META" | cut -d= -f2-)
-        printf "  ${CYAN}%-4s${NC} %-30s %-22s %s\n" "$I)" "$NAME" "$DATE" "$SIZE"
+        TYPE=$(grep '^type=' "$META" | cut -d= -f2-)
+        SEQ=$(grep '^sequence=' "$META" | cut -d= -f2-)
+        [[ -z "$TYPE" ]] && TYPE="full"
+        local TLABEL="[$TYPE]"
+        [[ "$TYPE" == "incremental" ]] && TLABEL="[inc#$SEQ]"
+        printf "  ${CYAN}%-4s${NC} %-10s %-30s %-22s %s\n" "$I)" "$TLABEL" "$NAME" "$DATE" "$SIZE"
         I=$((I+1))
     done
 
@@ -293,9 +684,37 @@ delete_backup() {
     fi
 
     local SELECTED="${METAS[$((NUM-1))]}"
-    local DEL_FILE DEL_NAME
+    local DEL_FILE DEL_NAME DEL_TYPE
     DEL_FILE=$(grep '^file=' "$SELECTED" | cut -d= -f2-)
     DEL_NAME=$(grep '^name=' "$SELECTED" | cut -d= -f2-)
+    DEL_TYPE=$(grep '^type=' "$SELECTED" | cut -d= -f2-)
+    [[ -z "$DEL_TYPE" ]] && DEL_TYPE="full"
+
+    # Warn if deleting a base that has dependent incrementals
+    if [[ "$DEL_TYPE" == "full" || "$DEL_TYPE" == "light" ]]; then
+        local INC_COUNT=0
+        while IFS= read -r _; do INC_COUNT=$((INC_COUNT+1)); done \
+            < <(get_incrementals_for_base "$DEL_NAME")
+        if [[ $INC_COUNT -gt 0 ]]; then
+            echo ""
+            log_warn "WARNING: This base has $INC_COUNT incremental backup(s) depending on it!"
+            log_warn "Deleting it will make those incrementals unrestorable."
+            echo ""
+            read -rp "  Delete base AND all its incrementals? (yes/no): " CONF2
+            if [[ "$CONF2" == "yes" ]]; then
+                while IFS= read -r INC; do
+                    local INC_FILE INC_NAME
+                    INC_FILE=$(grep '^file=' "$INC" | cut -d= -f2-)
+                    INC_NAME=$(grep '^name=' "$INC" | cut -d= -f2-)
+                    [[ -f "$INC_FILE" ]] && rm -f "$INC_FILE"
+                    rm -f "$INC"
+                    log_ok "Deleted incremental: $INC_NAME"
+                done < <(get_incrementals_for_base "$DEL_NAME")
+            else
+                log_warn "Cancelled."; return
+            fi
+        fi
+    fi
 
     echo ""
     log_warn "About to delete: $DEL_NAME"
@@ -310,7 +729,6 @@ delete_backup() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# CHECK: enough disk space before restore
 check_disk_space() {
     local BACKUP_FILE="$1"
     log_step "Checking available disk space..."
@@ -318,14 +736,12 @@ check_disk_space() {
     local BACKUP_SIZE_KB
     BACKUP_SIZE_KB=$(du -k "$BACKUP_FILE" | cut -f1)
 
-    # estimate uncompressed size (~3x compressed)
     local ESTIMATED_KB=$(( BACKUP_SIZE_KB * 3 ))
     local AVAILABLE_KB
     AVAILABLE_KB=$(df / --output=avail -k | tail -1)
 
-    local ESTIMATED_HR
+    local ESTIMATED_HR AVAILABLE_HR
     ESTIMATED_HR=$(( ESTIMATED_KB / 1024 / 1024 ))
-    local AVAILABLE_HR
     AVAILABLE_HR=$(( AVAILABLE_KB / 1024 / 1024 ))
 
     log_info "Backup compressed size : ~$(( BACKUP_SIZE_KB / 1024 ))MB"
@@ -344,7 +760,6 @@ check_disk_space() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# FIX: UUID — matches by fstype AND mount point
 fix_uuid() {
     log_step "Fixing UUIDs in /etc/fstab..."
     local FSTAB="/etc/fstab"
@@ -370,15 +785,12 @@ fix_uuid() {
                 log_warn "UUID not found: $OLD (mount: $MOUNTPOINT, type: $FSTYPE)"
                 local NEW_UUID=""
 
-                # Strategy 1: match by mount point (most accurate)
                 if [[ "$MOUNTPOINT" == "/" ]]; then
-                    # find the currently mounted root device's UUID
                     local ROOT_DEV
                     ROOT_DEV=$(findmnt -n -o SOURCE /)
                     NEW_UUID=$(blkid -s UUID -o value "$ROOT_DEV" 2>/dev/null)
                 fi
 
-                # Strategy 2: match by fstype if strategy 1 failed
                 if [[ -z "$NEW_UUID" ]]; then
                     while IFS= read -r bl; do
                         local B_UUID B_TYPE
@@ -412,16 +824,13 @@ fix_uuid() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# FIX: network interface name mismatch
 fix_network() {
     local META_FILE="$1"
     log_step "Checking network interface compatibility..."
 
-    # get interface names from new server
     local NEW_IFACES
     NEW_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -1)
 
-    # get interface names from backup meta
     local OLD_IFACES=""
     if [[ -n "$META_FILE" && -f "$META_FILE" ]]; then
         OLD_IFACES=$(grep '^interfaces=' "$META_FILE" | cut -d= -f2- | tr ',' '\n' | grep -v '^$' | head -1)
@@ -440,7 +849,6 @@ fix_network() {
 
     local FIXED=0
 
-    # fix netplan configs
     for FILE in /etc/netplan/*.yaml /etc/netplan/*.yml; do
         [[ -f "$FILE" ]] || continue
         if grep -q "$OLD_IFACES" "$FILE" 2>/dev/null; then
@@ -451,7 +859,6 @@ fix_network() {
         fi
     done
 
-    # fix /etc/network/interfaces (older style)
     if [[ -f /etc/network/interfaces ]]; then
         if grep -q "$OLD_IFACES" /etc/network/interfaces 2>/dev/null; then
             cp /etc/network/interfaces /etc/network/interfaces.bak
@@ -461,7 +868,6 @@ fix_network() {
         fi
     fi
 
-    # fix systemd network files
     for FILE in /etc/systemd/network/*.network; do
         [[ -f "$FILE" ]] || continue
         if grep -q "$OLD_IFACES" "$FILE" 2>/dev/null; then
@@ -476,7 +882,6 @@ fix_network() {
         log_warn "No network config files contained '$OLD_IFACES' — check manually if network fails after reboot."
     else
         log_ok "$FIXED network config file(s) updated."
-        # regenerate netplan if available
         if command -v netplan &>/dev/null; then
             netplan generate 2>/dev/null && log_ok "Netplan config regenerated." || true
         fi
@@ -484,21 +889,16 @@ fix_network() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# FIX: kernel modules / VirtIO drivers
 fix_kernel_modules() {
     log_step "Checking kernel module compatibility..."
 
-    # ensure virtio modules are loaded (needed on KVM/QEMU/cloud VMs)
     local MODULES=(virtio_net virtio_blk virtio_scsi virtio_balloon)
-    local MISSING=0
-
     for MOD in "${MODULES[@]}"; do
         if ! lsmod | grep -q "^${MOD}" 2>/dev/null; then
             modprobe "$MOD" 2>/dev/null && log_ok "Loaded module: $MOD" || true
         fi
     done
 
-    # rebuild initramfs so new kernel picks up correct drivers
     if command -v update-initramfs &>/dev/null; then
         log_step "Rebuilding initramfs (this may take a moment)..."
         update-initramfs -u -k all >> "$LOG_FILE" 2>&1 && \
@@ -508,7 +908,6 @@ fix_kernel_modules() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# FIX: grub / bootloader
 fix_bootloader() {
     log_step "Updating GRUB bootloader..."
 
@@ -518,7 +917,6 @@ fix_bootloader() {
             log_warn "GRUB update had warnings."
     fi
 
-    # detect root disk and reinstall grub
     local ROOT_DISK
     ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1)
     if [[ -n "$ROOT_DISK" ]]; then
@@ -532,7 +930,6 @@ fix_bootloader() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# SUMMARY REPORT after restore
 print_restore_report() {
     echo ""
     echo -e "  ${CYAN}${BOLD}╔══════════════════════════════════════════╗${NC}"
@@ -552,6 +949,33 @@ print_restore_report() {
     echo ""
 }
 
+# Apply an ordered array of meta files as restore layers
+apply_restore_chain() {
+    local METAS=("$@")
+    for META in "${METAS[@]}"; do
+        local FILE TYPE SEQ
+        FILE=$(grep '^file=' "$META" | cut -d= -f2-)
+        TYPE=$(grep '^type=' "$META" | cut -d= -f2-)
+        SEQ=$(grep '^sequence=' "$META" | cut -d= -f2-)
+        [[ -z "$TYPE" ]] && TYPE="full"
+        [[ "$TYPE" == "incremental" ]] && TYPE="inc#$SEQ"
+
+        if [[ ! -f "$FILE" ]]; then
+            log_err "Archive not found: $FILE"; return 1
+        fi
+        check_disk_space "$FILE" || return 1
+
+        log_step "Applying [$TYPE] layer: $(basename "$FILE")..."
+        tar -xzpf "$FILE" -C / \
+            --exclude=./proc --exclude=./sys \
+            --exclude=./dev  --exclude=./run \
+            2>/dev/null
+        log_ok "Layer applied: $(basename "$FILE")"
+        echo ""
+    done
+    return 0
+}
+
 # ─────────────────────────────────────────────────────────────
 do_restore() {
     banner
@@ -569,6 +993,7 @@ do_restore() {
 
     local RESTORE_FILE=""
     local RESTORE_META=""
+    local USE_CHAIN=0
 
     case "$SRC" in
         1)
@@ -581,10 +1006,15 @@ do_restore() {
             fi
             local I=1
             for META in "${METAS[@]}"; do
-                NAME=$(grep '^name=' "$META" | cut -d= -f2-)
-                DATE=$(grep '^date=' "$META" | cut -d= -f2-)
-                SIZE=$(grep '^size=' "$META" | cut -d= -f2-)
-                printf "  ${CYAN}%-4s${NC} %-30s %-22s %s\n" "$I)" "$NAME" "$DATE" "$SIZE"
+                local N D S T SEQ
+                N=$(grep '^name=' "$META" | cut -d= -f2-)
+                D=$(grep '^date=' "$META" | cut -d= -f2-)
+                S=$(grep '^size=' "$META" | cut -d= -f2-)
+                T=$(grep '^type=' "$META" | cut -d= -f2-)
+                SEQ=$(grep '^sequence=' "$META" | cut -d= -f2-)
+                [[ -z "$T" ]] && T="full"
+                [[ "$T" == "incremental" ]] && T="inc#$SEQ"
+                printf "  ${CYAN}%-4s${NC} [%-8s] %-30s %-22s %s\n" "$I)" "$T" "$N" "$D" "$S"
                 I=$((I+1))
             done
             echo ""
@@ -592,15 +1022,39 @@ do_restore() {
             if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [[ $NUM -lt 1 || $NUM -gt ${#METAS[@]} ]]; then
                 log_err "Invalid."; return
             fi
-            RESTORE_FILE=$(grep '^file=' "${METAS[$((NUM-1))]}" | cut -d= -f2-)
             RESTORE_META="${METAS[$((NUM-1))]}"
+            RESTORE_FILE=$(grep '^file=' "$RESTORE_META" | cut -d= -f2-)
+            local RESTORE_TYPE
+            RESTORE_TYPE=$(grep '^type=' "$RESTORE_META" | cut -d= -f2-)
+            [[ -z "$RESTORE_TYPE" ]] && RESTORE_TYPE="full"
+
+            local BASE_META
+            if [[ "$RESTORE_TYPE" == "incremental" ]]; then
+                BASE_META=$(find_base_meta "$RESTORE_META") || return
+            else
+                BASE_META="$RESTORE_META"
+            fi
+
+            local BASE_NAME INC_COUNT=0
+            BASE_NAME=$(grep '^name=' "$BASE_META" | cut -d= -f2-)
+            while IFS= read -r _; do INC_COUNT=$((INC_COUNT+1)); done \
+                < <(get_incrementals_for_base "$BASE_NAME")
+
+            if [[ $INC_COUNT -gt 0 || "$RESTORE_TYPE" == "incremental" ]]; then
+                _CHAIN_RESULT=()
+                ask_chain_checkpoint "$BASE_META" || return
+                USE_CHAIN=1
+            else
+                _CHAIN_RESULT=("$RESTORE_META")
+                USE_CHAIN=1
+            fi
             ;;
         2)
             read -rp "  File path: " RESTORE_FILE
             [[ ! -f "$RESTORE_FILE" ]] && { log_err "File not found."; return; }
-            # look for matching .meta file
             RESTORE_META="${RESTORE_FILE%.tar.gz}.meta"
             [[ ! -f "$RESTORE_META" ]] && RESTORE_META=""
+            USE_CHAIN=0
             ;;
         3)
             read -rp "  Download URL: " URL
@@ -615,6 +1069,7 @@ do_restore() {
             [[ ! -f "$RESTORE_FILE" ]] && { log_err "Download failed."; return; }
             log_ok "Download complete."
             RESTORE_META=""
+            USE_CHAIN=0
             ;;
         *)
             log_err "Invalid choice."; return ;;
@@ -623,57 +1078,73 @@ do_restore() {
     echo ""
     log_section "RESTORE START"
 
-    # ── PRE-RESTORE CHECKS ──
-    log_step "Running pre-restore checks..."
-    echo ""
+    if [[ "$USE_CHAIN" -eq 1 ]]; then
+        echo ""
+        log_info "Restore plan — ${#_CHAIN_RESULT[@]} layer(s) will be applied in order:"
+        for M in "${_CHAIN_RESULT[@]}"; do
+            local N T SEQ
+            N=$(grep '^name=' "$M" | cut -d= -f2-)
+            T=$(grep '^type=' "$M" | cut -d= -f2-)
+            SEQ=$(grep '^sequence=' "$M" | cut -d= -f2-)
+            [[ -z "$T" ]] && T="full"
+            [[ "$T" == "incremental" ]] && T="inc#$SEQ"
+            log_info "  → [$T] $N"
+        done
+        echo ""
+        log_warn "This will overwrite your current system!"
+        read -rp "  Type YES to confirm: " CONF
+        [[ "$CONF" != "YES" ]] && { log_warn "Cancelled."; return; }
+        echo ""
 
-    # 1. disk space
-    check_disk_space "$RESTORE_FILE" || return
+        apply_restore_chain "${_CHAIN_RESULT[@]}" || return
 
-    echo ""
-    log_info "Backup file: $RESTORE_FILE"
-    log_warn "This will overwrite your current system!"
-    read -rp "  Type YES to confirm: " CONF
-    [[ "$CONF" != "YES" ]] && { log_warn "Cancelled."; return; }
+        fix_uuid
+        echo ""
+        fix_network "${_CHAIN_RESULT[0]}"
+        echo ""
+        fix_kernel_modules
+        echo ""
+        fix_bootloader
+        echo ""
+        log_step "Reloading systemd..."
+        systemctl daemon-reexec 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        log_ok "systemd reloaded."
+    else
+        # Single file restore (manual path or URL download)
+        log_step "Running pre-restore checks..."
+        echo ""
+        check_disk_space "$RESTORE_FILE" || return
 
-    echo ""
+        echo ""
+        log_info "Backup file: $RESTORE_FILE"
+        log_warn "This will overwrite your current system!"
+        read -rp "  Type YES to confirm: " CONF
+        [[ "$CONF" != "YES" ]] && { log_warn "Cancelled."; return; }
+        echo ""
 
-    # ── EXTRACT ──
-    log_step "Extracting backup to system..."
-    tar -xzpf "$RESTORE_FILE" -C / \
-        --exclude=./proc --exclude=./sys \
-        --exclude=./dev  --exclude=./run \
-        2>/dev/null
-    log_ok "Extraction complete."
-    echo ""
+        log_step "Extracting backup to system..."
+        tar -xzpf "$RESTORE_FILE" -C / \
+            --exclude=./proc --exclude=./sys \
+            --exclude=./dev  --exclude=./run \
+            2>/dev/null
+        log_ok "Extraction complete."
+        echo ""
 
-    # ── POST-RESTORE FIXES ──
-    log_step "Running post-restore fixes..."
-    echo ""
+        fix_uuid
+        echo ""
+        fix_network "$RESTORE_META"
+        echo ""
+        fix_kernel_modules
+        echo ""
+        fix_bootloader
+        echo ""
+        log_step "Reloading systemd..."
+        systemctl daemon-reexec 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        log_ok "systemd reloaded."
+    fi
 
-    # 2. UUID fix (accurate: mount point aware)
-    fix_uuid
-    echo ""
-
-    # 3. network interface name fix
-    fix_network "$RESTORE_META"
-    echo ""
-
-    # 4. kernel modules + initramfs rebuild
-    fix_kernel_modules
-    echo ""
-
-    # 5. bootloader
-    fix_bootloader
-    echo ""
-
-    # 6. reload systemd
-    log_step "Reloading systemd..."
-    systemctl daemon-reexec 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
-    log_ok "systemd reloaded."
-
-    # ── REPORT ──
     print_restore_report
 }
 
@@ -733,5 +1204,5 @@ main_menu
 EOF
 sudo chmod +x /usr/local/bin/black-backup
 echo ""
-echo -e "\033[0;32m[✔]\033[0m black-backup v2.0 installed! Run: \033[0;36mblack-backup\033[0m"
+echo -e "\033[0;32m[✔]\033[0m black-backup v3.0 installed! Run: \033[0;36mblack-backup\033[0m"
 echo ""
